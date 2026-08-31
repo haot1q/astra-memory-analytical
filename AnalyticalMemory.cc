@@ -12,12 +12,26 @@ the root directory of this source tree.
 #include "astra-sim/system/Common.hh"
 #include "astra-sim/system/WorkloadLayerHandlerData.hh"
 #include "astra-sim/system/AstraMemoryAPI.hh"
-using AstraSim::MemoryLocationType; 
+using AstraSim::MemoryLocationType;
 
 using namespace std;
 using namespace AstraSim;
 using namespace Analytical;
 using json = nlohmann::json;
+
+namespace {
+
+Callable* completion_target(WorkloadLayerHandlerData* wlhd) {
+  if (wlhd->completion_target != nullptr) {
+    return wlhd->completion_target;
+  }
+  if (wlhd->workload != nullptr) {
+    return wlhd->workload;
+  }
+  throw invalid_argument("memory request has no completion target");
+}
+
+}  // namespace
 
 AnalyticalMemory::AnalyticalMemory(
     string memory_configuration) {
@@ -165,7 +179,8 @@ void AnalyticalMemory::issue(
 
       sys->register_event(this, EventType::General, wlhd, runtime);
 
-      sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
+      sys->register_event(
+          completion_target(wlhd), EventType::General, wlhd, runtime);
 
       pim_ongoing_transaction[queue_idx] = true;
     }
@@ -182,7 +197,8 @@ void AnalyticalMemory::issue(
       const uint64_t runtime = get_mem_runtime(request);
       Sys* sys = sys_map.at(sys_id);
       wlhd->memory_operation = request.operation;
-      sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
+      sys->register_event(
+          completion_target(wlhd), EventType::General, wlhd, runtime);
       return;
     }
     const size_t request_queue = queue_index(device_id, request.operation);
@@ -213,7 +229,7 @@ void AnalyticalMemory::call(EventType type, CallData* data) {
       sys->register_event(this, EventType::General, pmr.wlhd, runtime);
 
       sys->register_event(
-          pmr.wlhd->workload, EventType::General, pmr.wlhd, runtime);
+          completion_target(pmr.wlhd), EventType::General, pmr.wlhd, runtime);
 
       pim_ongoing_transaction[queue_idx] = true;
     } else {
@@ -271,7 +287,8 @@ void AnalyticalMemory::start_request(
   Sys* sys = sys_map.at(wlhd->sys_id);
   wlhd->memory_operation = request.operation;
   sys->register_event(this, EventType::General, wlhd, runtime);
-  sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
+  sys->register_event(
+      completion_target(wlhd), EventType::General, wlhd, runtime);
   ongoing_transaction.at(queue_idx) = true;
 }
 
