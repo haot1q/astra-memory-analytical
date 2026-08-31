@@ -7,6 +7,8 @@ the root directory of this source tree.
 #include <json/json.hpp>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include "astra-sim/system/Common.hh"
 #include "astra-sim/system/WorkloadLayerHandlerData.hh"
 #include "astra-sim/system/AstraMemoryAPI.hh"
@@ -18,7 +20,7 @@ using namespace Analytical;
 using json = nlohmann::json;
 
 AnalyticalMemory::AnalyticalMemory(
-    string memory_configuration) noexcept {
+    string memory_configuration) {
   ifstream conf_file;
 
   conf_file.open(memory_configuration);
@@ -73,9 +75,33 @@ AnalyticalMemory::AnalyticalMemory(
     mem_latency = j["mem-latency"];
   }
 
-  mem_bw = 0;
-  if (j.contains("mem-bw")) {
-    mem_bw = j["mem-bw"];
+  const bool has_scalar_bandwidth = j.contains("mem-bw");
+  const bool has_directional_bandwidth = j.contains("bandwidth-resource");
+  if (has_scalar_bandwidth == has_directional_bandwidth) {
+    throw invalid_argument(
+        "memory configuration must declare exactly one of mem-bw or "
+        "bandwidth-resource");
+  }
+  legacy_scalar_bandwidth = has_scalar_bandwidth;
+  if (has_scalar_bandwidth) {
+    if (!j["mem-bw"].is_number_unsigned() ||
+        j["mem-bw"].get<uint64_t>() == 0 ||
+        j["mem-bw"].get<uint64_t>() >
+            numeric_limits<uint64_t>::max() / 1'000'000'000ULL) {
+      throw invalid_argument("mem-bw must be a positive uint64 GB/s");
+    }
+    const uint64_t bytes_per_second =
+        j["mem-bw"].get<uint64_t>() * 1'000'000'000ULL;
+    bandwidth_resource.emplace(AstraSim::BandwidthResourceConfig{
+        bytes_per_second,
+        bytes_per_second,
+        bytes_per_second,
+        AstraSim::BandwidthConcurrency::Serialized,
+        0,
+    });
+  } else {
+    bandwidth_resource.emplace(AstraSim::parse_bandwidth_resource_config(
+        j["bandwidth-resource"], "bandwidth-resource"));
   }
 
   num_devices = 1;
@@ -88,32 +114,16 @@ AnalyticalMemory::AnalyticalMemory(
     pim_channels = j["pim-channels"];
   }
 
-  if (mem_type == PER_NODE_MEMORY_EXPANSION) {
-    for (int i = 0; i < num_devices; i++) {
-      ongoing_transaction.push_back(false);
-      deque<PendingMemoryRequest> dpmr;
-      pending_requests.push_back(dpmr);
-
-      // pim reqeust queue
-      for (int i = 0; i < pim_channels; i++) {
-        pim_ongoing_transaction.push_back(false);
-        deque<PendingMemoryRequest> pim_dpmr;
-        pim_pending_requests.push_back(pim_dpmr);
-      }
-    }
-  } else if (mem_type == MEMORY_POOL) {
-    for (int i = 0; i < num_devices; i++) {
-      ongoing_transaction.push_back(false);
-      deque<PendingMemoryRequest> dpmr;
-      pending_requests.push_back(dpmr);
-
-      // pim reqeust queue
-      for (int i = 0; i < pim_channels; i++) {
-        pim_ongoing_transaction.push_back(false);
-        deque<PendingMemoryRequest> pim_dpmr;
-        pim_pending_requests.push_back(pim_dpmr);
-      }
-    }
+  if (mem_type != NO_MEMORY_EXPANSION) {
+    const size_t ordinary_queue_count =
+        static_cast<size_t>(num_devices) * bandwidth_resource->server_count();
+    ongoing_transaction.assign(ordinary_queue_count, false);
+    pending_requests.resize(ordinary_queue_count);
+    last_serialized_operation.resize(num_devices);
+    const size_t pim_queue_count =
+        static_cast<size_t>(num_devices) * pim_channels;
+    pim_ongoing_transaction.assign(pim_queue_count, false);
+    pim_pending_requests.resize(pim_queue_count);
   }
 
   conf_file.close();
@@ -124,9 +134,15 @@ void AnalyticalMemory::set_sys(int id, Sys* sys) {
 }
 
 void AnalyticalMemory::issue(
-    uint64_t tensor_size,
+    const MemoryRequest& request,
     WorkloadLayerHandlerData* wlhd) {
-  
+  if (wlhd == nullptr) {
+    throw invalid_argument("memory request handler data must not be null");
+  }
+  if (!bandwidth_resource.has_value()) {
+    throw logic_error("memory bandwidth resource is not initialized");
+  }
+  wlhd->memory_operation = request.operation;
   int sys_id = wlhd->sys_id;
   int device_id = wlhd->device_id;
   bool pim_enabled = wlhd->pim_enabled;
@@ -139,10 +155,10 @@ void AnalyticalMemory::issue(
     int pim_channel_id = wlhd->pim_channel_id;
     int queue_idx = num_devices * device_id + pim_channel_id;
     if (pim_ongoing_transaction[queue_idx]) {
-      PendingMemoryRequest pmr(tensor_size, wlhd);
+      PendingMemoryRequest pmr(request, wlhd);
       pim_pending_requests[queue_idx].push_back(pmr);
     } else {
-      uint64_t load_store_time = get_mem_runtime(tensor_size); // new tensors that need to be load/stored in pim
+      uint64_t load_store_time = get_mem_runtime(request);
       uint64_t runtime = wlhd->pim_runtime + load_store_time;
 
       Sys* sys = sys_map[sys_id];
@@ -158,43 +174,22 @@ void AnalyticalMemory::issue(
   // Ordinary memory access
   else {
     if (mem_type == NO_MEMORY_EXPANSION) {
-      cerr << "Memory access is not supported in NO_MEMORY_EXPANSION"
-          << endl;
-      exit(1);
-    } else if (mem_type == PER_NODE_MEMORY_EXPANSION) {
-      if (ongoing_transaction[device_id]) {
-        PendingMemoryRequest pmr(tensor_size, wlhd);
-        pending_requests[device_id].push_back(pmr);
-      } else {
-        uint64_t runtime = get_mem_runtime(tensor_size);
-
-        Sys* sys = sys_map[sys_id];
-
-        sys->register_event(this, EventType::General, wlhd, runtime);
-
-        sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
-
-        ongoing_transaction[device_id] = true;
-      }
-    } else if (mem_type == PER_NPU_MEMORY_EXPANSION) {
-      uint64_t runtime = get_mem_runtime(tensor_size);
-      Sys* sys = sys_map[sys_id];
+      throw invalid_argument(
+          "memory access is not supported in NO_MEMORY_EXPANSION");
+    }
+    if (legacy_scalar_bandwidth &&
+        mem_type == PER_NPU_MEMORY_EXPANSION) {
+      const uint64_t runtime = get_mem_runtime(request);
+      Sys* sys = sys_map.at(sys_id);
+      wlhd->memory_operation = request.operation;
       sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
-    } else if (mem_type == MEMORY_POOL) {
-      if (ongoing_transaction[device_id]) {
-        PendingMemoryRequest pmr(tensor_size, wlhd);
-        pending_requests[device_id].push_back(pmr);
-      } else {
-        uint64_t runtime = get_mem_runtime(tensor_size);
-
-        Sys* sys = sys_map[sys_id];
-
-        sys->register_event(this, EventType::General, wlhd, runtime);
-
-        sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
-
-        ongoing_transaction[device_id] = true;
-      }
+      return;
+    }
+    const size_t request_queue = queue_index(device_id, request.operation);
+    if (ongoing_transaction[request_queue]) {
+      pending_requests[request_queue].emplace_back(request, wlhd);
+    } else {
+      start_request(request, wlhd, request_queue);
     }
   }
 }
@@ -211,7 +206,7 @@ void AnalyticalMemory::call(EventType type, CallData* data) {
     if (!pim_pending_requests[queue_idx].empty()) {
       PendingMemoryRequest pmr = pim_pending_requests[queue_idx].front();
       pim_pending_requests[queue_idx].pop_front();
-      uint64_t load_store_time = get_mem_runtime(pmr.tensor_size); // new tensors that need to be load/stored in pim
+      uint64_t load_store_time = get_mem_runtime(pmr.request);
       uint64_t runtime = pmr.wlhd->pim_runtime + load_store_time;
       Sys* sys = sys_map[pmr.wlhd->sys_id];
 
@@ -227,49 +222,64 @@ void AnalyticalMemory::call(EventType type, CallData* data) {
     return;
   }
   // Ordinary memory access
-  else{
-    if (mem_type == PER_NODE_MEMORY_EXPANSION) {
-      if (!pending_requests[device_id].empty()) {
-        PendingMemoryRequest pmr = pending_requests[device_id].front();
-        pending_requests[device_id].pop_front();
-
-        uint64_t runtime = get_mem_runtime(pmr.tensor_size);
-
-        Sys* sys = sys_map[pmr.wlhd->sys_id];
-
-        sys->register_event(this, EventType::General, pmr.wlhd, runtime);
-
-        sys->register_event(
-            pmr.wlhd->workload, EventType::General, pmr.wlhd, runtime);
-
-        ongoing_transaction[device_id] = true;
-      } else {
-        ongoing_transaction[device_id] = false;
-      }
-    } else if (mem_type == MEMORY_POOL) {
-      if (!pending_requests[device_id].empty()) {
-        PendingMemoryRequest pmr = pending_requests[device_id].front();
-        pending_requests[device_id].pop_front();
-
-        uint64_t runtime = get_mem_runtime(pmr.tensor_size);
-
-        Sys* sys = sys_map[pmr.wlhd->sys_id];
-
-        sys->register_event(this, EventType::General, pmr.wlhd, runtime);
-
-        sys->register_event(
-            pmr.wlhd->workload, EventType::General, pmr.wlhd, runtime);
-
-        ongoing_transaction[device_id] = true;
-      } else {
-        ongoing_transaction[device_id] = false;
-      }
+  else {
+    const size_t request_queue =
+        queue_index(device_id, wlhd->memory_operation);
+    if (!pending_requests[request_queue].empty()) {
+      PendingMemoryRequest pmr = pending_requests[request_queue].front();
+      pending_requests[request_queue].pop_front();
+      start_request(pmr.request, pmr.wlhd, request_queue);
+    } else {
+      ongoing_transaction[request_queue] = false;
     }
   }
 }
 
-uint64_t AnalyticalMemory::get_mem_runtime(uint64_t tensor_size) {
-  uint64_t runtime = mem_latency
-      + static_cast<uint64_t>((static_cast<double>(tensor_size) / mem_bw));
-  return runtime;
+size_t AnalyticalMemory::queue_index(
+    uint32_t device_id,
+    MemoryOperation operation) const {
+  if (!bandwidth_resource.has_value()) {
+    throw logic_error("memory bandwidth resource is not initialized");
+  }
+  if (device_id >= num_devices) {
+    throw out_of_range(
+        "memory device_id " + to_string(device_id) +
+        " is out of range [0," + to_string(num_devices) + ")");
+  }
+  return static_cast<size_t>(device_id) * bandwidth_resource->server_count() +
+      bandwidth_resource->server_index(operation);
+}
+
+void AnalyticalMemory::start_request(
+    const MemoryRequest& request,
+    WorkloadLayerHandlerData* wlhd,
+    size_t queue_idx) {
+  uint64_t runtime = get_mem_runtime(request);
+  const auto& resource_config = bandwidth_resource->config();
+  if (resource_config.concurrency == BandwidthConcurrency::Serialized) {
+    auto& previous = last_serialized_operation.at(wlhd->device_id);
+    if (previous.has_value()) {
+      const uint64_t turnaround = bandwidth_resource->turnaround_delay_ns(
+          *previous, request.operation);
+      if (runtime > numeric_limits<uint64_t>::max() - turnaround) {
+        throw overflow_error("memory runtime plus turnaround exceeds uint64 ns");
+      }
+      runtime += turnaround;
+    }
+    previous = request.operation;
+  }
+  Sys* sys = sys_map.at(wlhd->sys_id);
+  wlhd->memory_operation = request.operation;
+  sys->register_event(this, EventType::General, wlhd, runtime);
+  sys->register_event(wlhd->workload, EventType::General, wlhd, runtime);
+  ongoing_transaction.at(queue_idx) = true;
+}
+
+uint64_t AnalyticalMemory::get_mem_runtime(
+    const MemoryRequest& request) const {
+  if (!bandwidth_resource.has_value()) {
+    throw logic_error("memory bandwidth resource is not initialized");
+  }
+  return bandwidth_resource->service_time_ns(
+      request.bytes, request.operation, mem_latency);
 }
