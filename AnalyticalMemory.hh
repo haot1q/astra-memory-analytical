@@ -29,6 +29,8 @@ struct MemLevelConf {
 };
 
 namespace Analytical {
+struct AnalyticalMemoryTestAccess;
+
 enum MemoryArchitectureType {
   NO_MEMORY_EXPANSION = 0,
   PER_NODE_MEMORY_EXPANSION,
@@ -61,6 +63,8 @@ class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Calla
   AstraSim::MemoryLocationType get_memory_location_type() const override { return mem_loc_type; }
 
  private:
+  friend struct AnalyticalMemoryTestAccess;
+
   std::size_t queue_index(
       uint32_t device_id,
       AstraSim::MemoryOperation operation) const;

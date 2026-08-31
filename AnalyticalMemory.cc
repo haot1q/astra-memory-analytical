@@ -31,6 +31,15 @@ Callable* completion_target(WorkloadLayerHandlerData* wlhd) {
   throw invalid_argument("memory request has no completion target");
 }
 
+void record_memory_timing(WorkloadLayerHandlerData* wlhd, uint64_t runtime) {
+  const uint64_t start_ns = Sys::boostedTick();
+  if (runtime > numeric_limits<uint64_t>::max() - start_ns) {
+    throw overflow_error("memory completion time exceeds uint64 ns");
+  }
+  wlhd->memory_start_ns = start_ns;
+  wlhd->memory_finish_ns = start_ns + runtime;
+}
+
 }  // namespace
 
 AnalyticalMemory::AnalyticalMemory(
@@ -157,6 +166,7 @@ void AnalyticalMemory::issue(
     throw logic_error("memory bandwidth resource is not initialized");
   }
   wlhd->memory_operation = request.operation;
+  wlhd->memory_ready_ns = Sys::boostedTick();
   int sys_id = wlhd->sys_id;
   int device_id = wlhd->device_id;
   bool pim_enabled = wlhd->pim_enabled;
@@ -174,6 +184,7 @@ void AnalyticalMemory::issue(
     } else {
       uint64_t load_store_time = get_mem_runtime(request);
       uint64_t runtime = wlhd->pim_runtime + load_store_time;
+      record_memory_timing(wlhd, runtime);
 
       Sys* sys = sys_map[sys_id];
 
@@ -197,6 +208,7 @@ void AnalyticalMemory::issue(
       const uint64_t runtime = get_mem_runtime(request);
       Sys* sys = sys_map.at(sys_id);
       wlhd->memory_operation = request.operation;
+      record_memory_timing(wlhd, runtime);
       sys->register_event(
           completion_target(wlhd), EventType::General, wlhd, runtime);
       return;
@@ -224,6 +236,7 @@ void AnalyticalMemory::call(EventType type, CallData* data) {
       pim_pending_requests[queue_idx].pop_front();
       uint64_t load_store_time = get_mem_runtime(pmr.request);
       uint64_t runtime = pmr.wlhd->pim_runtime + load_store_time;
+      record_memory_timing(pmr.wlhd, runtime);
       Sys* sys = sys_map[pmr.wlhd->sys_id];
 
       sys->register_event(this, EventType::General, pmr.wlhd, runtime);
@@ -286,6 +299,7 @@ void AnalyticalMemory::start_request(
   }
   Sys* sys = sys_map.at(wlhd->sys_id);
   wlhd->memory_operation = request.operation;
+  record_memory_timing(wlhd, runtime);
   sys->register_event(this, EventType::General, wlhd, runtime);
   sys->register_event(
       completion_target(wlhd), EventType::General, wlhd, runtime);
