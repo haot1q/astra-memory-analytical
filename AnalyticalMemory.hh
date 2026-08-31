@@ -8,12 +8,15 @@ LICENSE file in the root directory of this source tree.
 
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "astra-sim/system/AstraMemoryAPI.hh"
 #include "astra-sim/system/Callable.hh"
 #include "astra-sim/system/Sys.hh"
+#include "astra-sim/system/memory/BandwidthResource.hh"
 
 struct MemLevelConf {
   std::string name;            // "local_mem", "remote_mem", "cxl_mem" key name
@@ -37,37 +40,48 @@ enum MemoryArchitectureType {
 class PendingMemoryRequest {
  public:
   PendingMemoryRequest(
-      uint64_t tensor_size,
+      AstraSim::MemoryRequest request,
       AstraSim::WorkloadLayerHandlerData* wlhd)
-    : tensor_size(tensor_size), wlhd(wlhd) {
+    : request(request), wlhd(wlhd) {
   }
 
-  uint64_t tensor_size;
+  AstraSim::MemoryRequest request;
   AstraSim::WorkloadLayerHandlerData* wlhd;
 };
 
 class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Callable{
  public:
-  AnalyticalMemory(std::string memory_configuration) noexcept;
+  AnalyticalMemory(std::string memory_configuration);
   void set_sys(int id, AstraSim::Sys* sys);
   void issue(
-      uint64_t tensor_size,
+      const AstraSim::MemoryRequest& request,
       AstraSim::WorkloadLayerHandlerData* wlhd);
   void call(AstraSim::EventType type, AstraSim::CallData* data);
-  uint64_t get_mem_runtime(uint64_t tensor_size);
+  uint64_t get_mem_runtime(const AstraSim::MemoryRequest& request) const;
   AstraSim::MemoryLocationType get_memory_location_type() const override { return mem_loc_type; }
 
  private:
+  std::size_t queue_index(
+      uint32_t device_id,
+      AstraSim::MemoryOperation operation) const;
+  void start_request(
+      const AstraSim::MemoryRequest& request,
+      AstraSim::WorkloadLayerHandlerData* wlhd,
+      std::size_t queue_idx);
+
   MemoryArchitectureType mem_type;
   AstraSim::MemoryLocationType mem_loc_type; 
   uint64_t mem_latency; // memory access latency in nanosec
-  uint64_t mem_bw; // memory bandwidth in GB/sec
+  std::optional<AstraSim::BandwidthResource> bandwidth_resource;
+  bool legacy_scalar_bandwidth;
   uint32_t num_devices; // number of devices for this memory level
   uint32_t pim_channels; // number of PIM channels for this memory level
   std::vector<bool> ongoing_transaction;
 
   std::unordered_map<int, AstraSim::Sys*> sys_map;
   std::vector<std::deque<PendingMemoryRequest>> pending_requests;
+  std::vector<std::optional<AstraSim::MemoryOperation>>
+      last_serialized_operation;
 
   // pim implementation
   std::vector<bool> pim_ongoing_transaction;
