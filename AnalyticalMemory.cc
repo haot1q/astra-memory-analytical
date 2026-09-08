@@ -40,6 +40,17 @@ void record_memory_timing(WorkloadLayerHandlerData* wlhd, uint64_t runtime) {
   wlhd->memory_finish_ns = start_ns + runtime;
 }
 
+bool physical_service_mode(const json& config) {
+  if (!config.contains("physical-service-mode")) return false;
+  if (config["physical-service-mode"] != "native-single-device-v1" ||
+      config.value("memory-type", "") != "MEMORY_POOL" ||
+      config.value("num-devices", 0) != 1 ||
+      config.value("pim-channels", 0) != 0) {
+    throw invalid_argument("invalid physical-service-mode backend configuration");
+  }
+  return true;
+}
+
 }  // namespace
 
 AnalyticalMemory::AnalyticalMemory(
@@ -54,6 +65,7 @@ AnalyticalMemory::AnalyticalMemory(
 
   json j;
   conf_file >> j;
+  this->physical_service_mode = ::physical_service_mode(j);
 
   if (j.contains("memory-type")) {
     string mem_type_str = j["memory-type"];
@@ -156,6 +168,14 @@ void AnalyticalMemory::set_sys(int id, Sys* sys) {
   sys_map[id] = sys;
 }
 
+uint32_t AnalyticalMemory::service_device(const WorkloadLayerHandlerData* handler) const {
+  if (handler->service_device_id.has_value() != physical_service_mode ||
+      (physical_service_mode && handler->pim_enabled)) {
+    throw invalid_argument("physical/legacy service context mismatch or native PIM request");
+  }
+  return handler->service_device_id.value_or(handler->device_id);
+}
+
 void AnalyticalMemory::issue(
     const MemoryRequest& request,
     WorkloadLayerHandlerData* wlhd) {
@@ -165,10 +185,10 @@ void AnalyticalMemory::issue(
   if (!bandwidth_resource.has_value()) {
     throw logic_error("memory bandwidth resource is not initialized");
   }
+  const uint32_t device_id = service_device(wlhd);
   wlhd->memory_operation = request.operation;
   wlhd->memory_ready_ns = Sys::boostedTick();
   int sys_id = wlhd->sys_id;
-  int device_id = wlhd->device_id;
   bool pim_enabled = wlhd->pim_enabled;
   // PIM operation
   if (pim_enabled) {
@@ -223,8 +243,23 @@ void AnalyticalMemory::issue(
 }
 
 void AnalyticalMemory::call(EventType type, CallData* data) {
+  try {
+    complete_request(data);
+  } catch (...) {
+    // Sys::call_events logs exceptions. Preserve a native fatal error for the
+    // run owner even when it originates while starting an already queued job.
+    if (physical_service_mode && !failure_) failure_ = current_exception();
+    throw;
+  }
+}
+
+void AnalyticalMemory::rethrow_failure() const {
+  if (failure_) rethrow_exception(failure_);
+}
+
+void AnalyticalMemory::complete_request(CallData* data) {
   WorkloadLayerHandlerData* wlhd = (WorkloadLayerHandlerData*)data;
-  int device_id = wlhd->device_id;
+  const uint32_t device_id = service_device(wlhd);
   bool pim_enabled = wlhd->pim_enabled;
 
   // PIM operation
@@ -286,7 +321,7 @@ void AnalyticalMemory::start_request(
   uint64_t runtime = get_mem_runtime(request);
   const auto& resource_config = bandwidth_resource->config();
   if (resource_config.concurrency == BandwidthConcurrency::Serialized) {
-    auto& previous = last_serialized_operation.at(wlhd->device_id);
+    auto& previous = last_serialized_operation.at(service_device(wlhd));
     if (previous.has_value()) {
       const uint64_t turnaround = bandwidth_resource->turnaround_delay_ns(
           *previous, request.operation);

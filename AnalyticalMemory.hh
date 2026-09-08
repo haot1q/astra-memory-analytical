@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -59,11 +60,17 @@ class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Calla
       const AstraSim::MemoryRequest& request,
       AstraSim::WorkloadLayerHandlerData* wlhd);
   void call(AstraSim::EventType type, AstraSim::CallData* data);
+  // Native run owners must inspect asynchronous failures after event progress.
+  void rethrow_failure() const;
   uint64_t get_mem_runtime(const AstraSim::MemoryRequest& request) const;
   AstraSim::MemoryLocationType get_memory_location_type() const override { return mem_loc_type; }
 
  private:
   friend struct AnalyticalMemoryTestAccess;
+
+  uint32_t service_device(const AstraSim::WorkloadLayerHandlerData* handler) const;
+  void complete_request(AstraSim::CallData* data);
+  std::exception_ptr failure_;
 
   std::size_t queue_index(
       uint32_t device_id,
@@ -78,6 +85,7 @@ class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Calla
   uint64_t mem_latency; // memory access latency in nanosec
   std::optional<AstraSim::BandwidthResource> bandwidth_resource;
   bool legacy_scalar_bandwidth;
+  bool physical_service_mode = false;
   uint32_t num_devices; // number of devices for this memory level
   uint32_t pim_channels; // number of PIM channels for this memory level
   std::vector<bool> ongoing_transaction;
