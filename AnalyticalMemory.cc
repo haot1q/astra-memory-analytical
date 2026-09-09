@@ -347,5 +347,5 @@ uint64_t AnalyticalMemory::get_mem_runtime(
     throw logic_error("memory bandwidth resource is not initialized");
   }
   return bandwidth_resource->service_time_ns(
-      request.bytes, request.operation, mem_latency);
+      request.bytes, request.operation, mem_latency, request.rounding);
 }
