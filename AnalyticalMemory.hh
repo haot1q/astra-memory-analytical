@@ -54,7 +54,7 @@ class PendingMemoryRequest {
 
 class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Callable{
  public:
-  AnalyticalMemory(std::string memory_configuration);
+  AnalyticalMemory(std::string memory_configuration, bool* failure_seen = nullptr);
   void set_sys(int id, AstraSim::Sys* sys);
   void issue(
       const AstraSim::MemoryRequest& request,
@@ -71,6 +71,7 @@ class AnalyticalMemory : public AstraSim::AstraMemoryAPI, public AstraSim::Calla
   uint32_t service_device(const AstraSim::WorkloadLayerHandlerData* handler) const;
   void complete_request(AstraSim::CallData* data);
   std::exception_ptr failure_;
+  bool* failure_seen_;  // Optional single-thread owner flag; must outlive this memory.
 
   std::size_t queue_index(
       uint32_t device_id,
