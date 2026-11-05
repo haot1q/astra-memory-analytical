@@ -54,7 +54,7 @@ bool physical_service_mode(const json& config) {
 }  // namespace
 
 AnalyticalMemory::AnalyticalMemory(
-    string memory_configuration) {
+    string memory_configuration, bool* failure_seen) : failure_seen_(failure_seen) {
   ifstream conf_file;
 
   conf_file.open(memory_configuration);
@@ -248,7 +248,10 @@ void AnalyticalMemory::call(EventType type, CallData* data) {
   } catch (...) {
     // Sys::call_events logs exceptions. Preserve a native fatal error for the
     // run owner even when it originates while starting an already queued job.
-    if (physical_service_mode && !failure_) failure_ = current_exception();
+    if (physical_service_mode && !failure_) {
+      failure_ = current_exception();
+      if (failure_seen_) *failure_seen_ = true;
+    }
     throw;
   }
 }
